@@ -1,19 +1,25 @@
 # Use TLS 1.2 for downloads
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Allow running the script in this session
+# Allow running downloaded scripts in this session
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
-# Make sure the PSGallery repository is available
-Set-PSRepository -Name "PSGallery" -InstallationPolicy Trusted
+# Make sure NuGet provider is installed
+Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
 
-# Install the Autopilot info script from the gallery
+# Trust the PowerShell Gallery to avoid prompts
+Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+
+# Update PowerShellGet so Install-Script behaves consistently
+Install-Module PowerShellGet -Force
+Import-Module PowerShellGet
+
+# Install the Autopilot script
 Install-Script -Name Get-WindowsAutopilotInfo -Force
 
-# Find where it was installed, then run it
+# Locate the installed script path and run it online
 $script = Get-Command Get-WindowsAutopilotInfo.ps1 -ErrorAction SilentlyContinue
 if (-not $script) {
-    # Common install locations
     $possible = @(
         "$env:USERPROFILE\Documents\WindowsPowerShell\Scripts\Get-WindowsAutopilotInfo.ps1",
         "$env:ProgramFiles\WindowsPowerShell\Scripts\Get-WindowsAutopilotInfo.ps1",
@@ -21,3 +27,4 @@ if (-not $script) {
     )
     foreach ($p in $possible) { if (Test-Path $p) { $script = Get-Item $p; break } }
 }
+& $script.FullName -Online
