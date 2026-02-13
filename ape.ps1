@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 try {
-    # Suppress Microsoft Graph SDK welcome/banner noise (if respected by Graph modules)
+    # Suppress Microsoft Graph SDK welcome/banner noise (applies to this process)
     $env:MG_SHOW_WELCOME_MESSAGE = 'false'
 
     # Networking in OOBE
@@ -26,28 +26,31 @@ try {
         Set-PSRepository -Name PSGallery -InstallationPolicy Trusted | Out-Null
     }
 
-    # PowerShellGet (best effort) – improves Install-Script reliability in OOBE
+    # PowerShellGet (best effort) – suppress PackageManagement-in-use noise in OOBE
     try {
-        Install-Module -Name PowerShellGet -Force -AllowClobber -Scope CurrentUser | Out-Null
-        Import-Module PowerShellGet -Force | Out-Null
+        Install-Module -Name PowerShellGet -Force -AllowClobber -Scope CurrentUser -ErrorAction Stop | Out-Null
+        Import-Module PowerShellGet -Force -ErrorAction Stop | Out-Null
     }
     catch {
+        if ($_.Exception.Message -match "PackageManagement.*currently in use") {
+            # Expected in OOBE; continue with in-box modules
+        }
+        else {
+            # Keep this quiet unless you want to see it
+            # Write-Warning "PowerShellGet update/import issue (continuing): $($_.Exception.Message)"
+        }
+
         Import-Module PowerShellGet -ErrorAction SilentlyContinue | Out-Null
     }
 
     # ------------------------------------------------------------
     # PRE-CLEAN: remove any prior Get-WindowsAutopilotInfo.ps1 copies
     # ------------------------------------------------------------
-
     $pathsToRemove = New-Object System.Collections.Generic.List[string]
 
-    # If discoverable via Get-Command, include its source path
     $existingCmd = Get-Command Get-WindowsAutopilotInfo -ErrorAction SilentlyContinue
-    if ($existingCmd -and $existingCmd.Source) {
-        [void]$pathsToRemove.Add($existingCmd.Source)
-    }
+    if ($existingCmd -and $existingCmd.Source) { [void]$pathsToRemove.Add($existingCmd.Source) }
 
-    # Common Install-Script destinations
     $common = @(
         (Join-Path $env:USERPROFILE  'Documents\WindowsPowerShell\Scripts\Get-WindowsAutopilotInfo.ps1'),
         (Join-Path $env:ProgramFiles 'WindowsPowerShell\Scripts\Get-WindowsAutopilotInfo.ps1'),
@@ -55,25 +58,18 @@ try {
     )
     foreach ($p in $common) { [void]$pathsToRemove.Add($p) }
 
-    # De-duplicate
     $pathsToRemove = $pathsToRemove | Select-Object -Unique
 
     foreach ($p in $pathsToRemove) {
         if (Test-Path -LiteralPath $p) {
-            try {
-                Remove-Item -LiteralPath $p -Force -ErrorAction Stop
-            }
-            catch {
-                # If we can't remove (rare in OOBE), continue; reinstall will still proceed
-                Write-Warning "Could not remove existing script at: $p. Continuing. $($_.Exception.Message)"
-            }
+            try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop }
+            catch { }
         }
     }
 
     # ------------------------------------------------------------
     # INSTALL: Get-WindowsAutopilotInfo (conditional SkipPublisherCheck)
     # ------------------------------------------------------------
-
     $installScriptParams = @{
         Name  = 'Get-WindowsAutopilotInfo'
         Force = $true
@@ -86,7 +82,7 @@ try {
 
     Install-Script @installScriptParams | Out-Null
 
-    # Resolve the script path robustly after reinstall
+    # Resolve script path after reinstall
     $cmd = Get-Command Get-WindowsAutopilotInfo -ErrorAction SilentlyContinue
     $scriptPath = $null
 
@@ -102,9 +98,8 @@ try {
     }
 
     # ------------------------------------------------------------
-    # RUN: child process capture to hard-suppress 'Group Tag' noise
+    # RUN: child process capture (guarantees we can hide Graph banners)
     # ------------------------------------------------------------
-
     $outFile = Join-Path $env:TEMP ("autopilot_out_{0}.txt" -f ([guid]::NewGuid().ToString()))
     $errFile = Join-Path $env:TEMP ("autopilot_err_{0}.txt" -f ([guid]::NewGuid().ToString()))
 
@@ -112,11 +107,17 @@ try {
     New-Item -Path $errFile -ItemType File -Force | Out-Null
 
     $psExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+    # In the child process, suppress Graph welcome banner as well
+    $childCommand = @"
+`$env:MG_SHOW_WELCOME_MESSAGE='false'
+& '$scriptPath' -Online
+"@
+
     $argList = @(
         '-NoProfile',
         '-ExecutionPolicy', 'Bypass',
-        '-Command',
-        "& '$scriptPath' -Online"
+        '-Command', $childCommand
     )
 
     $p = Start-Process -FilePath $psExe -ArgumentList $argList -Wait -PassThru `
@@ -129,36 +130,93 @@ try {
 
     Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
 
-    # Filter known benign message (it may appear in stdout or stderr)
-    $filterRegex = 'property\s+"Group Tag"\s+cannot be found'
-    $stdoutFiltered = @($stdout | Where-Object { $_ -notmatch $filterRegex })
-    $stderrFiltered = @($stderr | Where-Object { $_ -notmatch $filterRegex })
+    # ------------------------------------------------------------
+    # OUTPUT FILTERING: whitelist only what you want engineers to see
+    # ------------------------------------------------------------
 
-    # Optional: echo normal output. Comment these two blocks out if you want near-silent success.
-    if ($stdoutFiltered.Count -gt 0) { $stdoutFiltered | ForEach-Object { Write-Output $_ } }
+    # Drop known noisy lines (Graph welcome, notes, WAM messages, etc.)
+    $noisePatterns = @(
+        '^Welcome to Microsoft Graph!',
+        '^Connected via delegated access',
+        '^Readme:',
+        '^SDK Docs:',
+        '^API Docs:',
+        '^NOTE:',
+        'Web Account Manager',
+        '\bWAM\b',
+        '\bNoWelcome\b',
+        'Set-MgGraphOption',
+        'clientId'
+    )
 
-    # Decide success/failure
-    if ($p.ExitCode -ne 0) {
-        # If the only error was the benign Group Tag message, treat as success
-        if ($stderrFiltered.Count -eq 0 -and ($stderr | Where-Object { $_ -match $filterRegex }).Count -gt 0) {
-            Write-Warning "Autopilot action completed; suppressed a known non-fatal output issue in Get-WindowsAutopilotInfo (Group Tag property)."
-            exit 0
-        }
+    # Drop the known benign "Group Tag" message anywhere it appears
+    $benignPatterns = @(
+        'property\s+"Group Tag"\s+cannot be found'
+    )
 
-        # Otherwise, surface real errors
-        if ($stderrFiltered.Count -gt 0) {
-            $stderrFiltered | ForEach-Object { Write-Error $_ }
-        }
-        else {
-            Write-Error "Get-WindowsAutopilotInfo failed with exit code $($p.ExitCode)."
-        }
-        exit 1
+    function Remove-Noise([string[]]$lines) {
+        $filtered = $lines
+        foreach ($pat in $noisePatterns)   { $filtered = $filtered | Where-Object { $_ -notmatch $pat } }
+        foreach ($pat in $benignPatterns)  { $filtered = $filtered | Where-Object { $_ -notmatch $pat } }
+        return ,$filtered
     }
 
-    # Child succeeded; show any remaining stderr as warnings (rare)
-    if ($stderrFiltered.Count -gt 0) { $stderrFiltered | ForEach-Object { Write-Warning $_ } }
+    $stdout = Remove-Noise $stdout
+    $stderr = Remove-Noise $stderr
 
-    exit 0
+    # Whitelist only the two key progress lines
+    $keepPatterns = @(
+        '^Connected to Intune tenant\b',
+        '^Gathered details for device with serial number:\b'
+    )
+
+    $kept = @()
+    foreach ($pat in $keepPatterns) {
+        $kept += $stdout | Where-Object { $_ -match $pat }
+        $kept += $stderr | Where-Object { $_ -match $pat }
+    }
+
+    # De-duplicate while preserving order
+    $seen = @{}
+    $keptUnique = foreach ($line in $kept) {
+        if (-not $seen.ContainsKey($line)) { $seen[$line] = $true; $line }
+    }
+
+    if ($keptUnique.Count -gt 0) {
+        $keptUnique | ForEach-Object { Write-Output $_ }
+    }
+
+    # ------------------------------------------------------------
+    # FINAL STATUS LINE (controlled by us)
+    # ------------------------------------------------------------
+
+    # Best-effort classification from remaining output
+    $allText = (($stdout + $stderr) -join "`n")
+
+    $looksAlready = $allText -match '(already\s+(imported|exists|registered|present))'
+    $looksImported = $allText -match '(import(ed)?\s+success|successfully\s+import|uploaded\s+success)'
+
+    if ($p.ExitCode -eq 0) {
+        if ($looksImported) {
+            Write-Output "Result: Imported successfully."
+        }
+        elseif ($looksAlready) {
+            Write-Output "Result: Already imported / no change."
+        }
+        else {
+            Write-Output "Result: Completed (verify in Intune if required)."
+        }
+        exit 0
+    }
+
+    # Non-zero exit: show remaining stderr (but still filtered) as the error
+    if ($stderr.Count -gt 0) {
+        $stderr | ForEach-Object { Write-Error $_ }
+    }
+    else {
+        Write-Error "Get-WindowsAutopilotInfo failed with exit code $($p.ExitCode)."
+    }
+    exit 1
 }
 catch {
     Write-Error $_
