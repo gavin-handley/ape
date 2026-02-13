@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 try {
-    # Suppress Microsoft Graph SDK welcome/banner noise (if respected by Graph modules)
+    # Suppress Microsoft Graph SDK welcome/banner noise (where respected)
     $env:MG_SHOW_WELCOME_MESSAGE = 'false'
 
     # Networking in OOBE
@@ -11,8 +11,6 @@ try {
 
     # Allow script execution in this process only
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
-
-    # Reduce noisy progress output
     $ProgressPreference = 'SilentlyContinue'
 
     # Ensure NuGet provider exists
@@ -35,10 +33,6 @@ try {
         if ($_.Exception.Message -match "PackageManagement.*currently in use") {
             # Expected in OOBE; continue with in-box modules
         }
-        else {
-            # Keep quiet unless you want to see it
-            # Write-Warning "PowerShellGet update/import issue (continuing): $($_.Exception.Message)"
-        }
         Import-Module PowerShellGet -ErrorAction SilentlyContinue | Out-Null
     }
 
@@ -57,12 +51,9 @@ try {
     )
     foreach ($p in $common) { [void]$pathsToRemove.Add($p) }
 
-    $pathsToRemove = @($pathsToRemove | Select-Object -Unique)
-
-    foreach ($p in $pathsToRemove) {
+    foreach ($p in @($pathsToRemove | Select-Object -Unique)) {
         if (Test-Path -LiteralPath $p) {
-            try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop }
-            catch { }
+            try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop } catch { }
         }
     }
 
@@ -97,46 +88,38 @@ try {
     }
 
     # ------------------------------------------------------------
-    # RUN: child process capture (guarantees we can hide Graph banners)
+    # RUN: child process capture (controls console output)
     # ------------------------------------------------------------
-    $outFile = Join-Path $env:TEMP ("autopilot_out_{0}.txt" -f ([guid]::NewGuid().ToString()))
-    $errFile = Join-Path $env:TEMP ("autopilot_err_{0}.txt" -f ([guid]::NewGuid().ToString()))
+    $outFile = Join-Path $env:TEMP ("autopilot_out_{0}.txt" -f ([guid]::NewGuid()))
+    $errFile = Join-Path $env:TEMP ("autopilot_err_{0}.txt" -f ([guid]::NewGuid()))
 
     New-Item -Path $outFile -ItemType File -Force | Out-Null
     New-Item -Path $errFile -ItemType File -Force | Out-Null
 
     $psExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
 
-    # In the child process, suppress Graph welcome banner as well
+    # Child command: also suppress Graph welcome there
     $childCommand = @"
 `$env:MG_SHOW_WELCOME_MESSAGE='false'
 & '$scriptPath' -Online
 "@
 
-    $argList = @(
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-Command', $childCommand
-    )
-
-    $p = Start-Process -FilePath $psExe -ArgumentList $argList -Wait -PassThru `
-        -WindowStyle Hidden `
+    $p = Start-Process -FilePath $psExe -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command', $childCommand) `
+        -Wait -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $outFile `
         -RedirectStandardError  $errFile
 
-    $stdout = Get-Content -LiteralPath $outFile -ErrorAction SilentlyContinue
-    $stderr = Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue
+    $stdout = @((Get-Content -LiteralPath $outFile -ErrorAction SilentlyContinue))
+    $stderr = @((Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue))
 
     Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
 
-    # Always treat these as string arrays (handles $null + single line output)
-    $stdout = @($stdout)
-    $stderr = @($stderr)
+    $all = @($stdout + $stderr)
+    $allText = ($all -join "`n")
 
     # ------------------------------------------------------------
-    # OUTPUT FILTERING: whitelist only what you want engineers to see
+    # FILTER: suppress Graph/WAM chatter + benign Group Tag noise
     # ------------------------------------------------------------
-
     $noisePatterns = @(
         '^Welcome to Microsoft Graph!',
         '^Connected via delegated access',
@@ -146,7 +129,6 @@ try {
         '^NOTE:',
         'Web Account Manager',
         '\bWAM\b',
-        '\bNoWelcome\b',
         'Set-MgGraphOption',
         'clientId'
     )
@@ -155,73 +137,68 @@ try {
         'property\s+"Group Tag"\s+cannot be found'
     )
 
-    function Remove-Noise {
-        param([string[]]$lines)
+    $filtered = $all
+    foreach ($pat in $noisePatterns)  { $filtered = @($filtered | Where-Object { $_ -notmatch $pat }) }
+    foreach ($pat in $benignPatterns) { $filtered = @($filtered | Where-Object { $_ -notmatch $pat }) }
 
-        $lines = @($lines)  # force array
-        if ($lines.Count -eq 0) { return @() }
-
-        $filtered = $lines
-        foreach ($pat in $noisePatterns)  { $filtered = @($filtered | Where-Object { $_ -notmatch $pat }) }
-        foreach ($pat in $benignPatterns) { $filtered = @($filtered | Where-Object { $_ -notmatch $pat }) }
-
-        return @($filtered)
-    }
-
-    $stdout = Remove-Noise -lines $stdout
-    $stderr = Remove-Noise -lines $stderr
-
-    # Whitelist only the two key progress lines
-    $keepPatterns = @(
-        '^Connected to Intune tenant\b',
-        '^Gathered details for device with serial number:\b'
+    # ------------------------------------------------------------
+    # PRINT: only the two progress lines you care about (if present)
+    # ------------------------------------------------------------
+    $progress = @(
+        $filtered | Where-Object { $_ -match '^Connected to Intune tenant\b' }
+    ) + @(
+        $filtered | Where-Object { $_ -match '^Gathered details for device with serial number:\b' }
     )
 
-    $kept = @()
-    foreach ($pat in $keepPatterns) {
-        $kept += @($stdout | Where-Object { $_ -match $pat })
-        $kept += @($stderr | Where-Object { $_ -match $pat })
-    }
-
-    # De-duplicate while preserving order, and keep as array
+    # De-dup while preserving order
     $seen = @{}
-    $keptUnique = @()
-    foreach ($line in @($kept)) {
-        if (-not $seen.ContainsKey($line)) {
+    foreach ($line in @($progress)) {
+        if (-not [string]::IsNullOrWhiteSpace($line) -and -not $seen.ContainsKey($line)) {
             $seen[$line] = $true
-            $keptUnique += $line
+            Write-Output $line
         }
     }
 
-    if (@($keptUnique).Count -gt 0) {
-        $keptUnique | ForEach-Object { Write-Output $_ }
-    }
-
     # ------------------------------------------------------------
-    # FINAL STATUS LINE (controlled by us)
+    # RESULT: deterministic mapping
     # ------------------------------------------------------------
 
-    $allText = (@($stdout + $stderr) -join "`n")
+    # Your known "already there" condition
+    $alreadyImported =
+        ($allText -match 'ZtdDeviceAlreadyAssigned') -or
+        ($allText -match '\b806\b.*ZtdDeviceAlreadyAssigned') -or
+        ($allText -match ':\s*806\s+ZtdDeviceAlreadyAssigned')
 
-    $looksAlready  = $allText -match '(already\s+(imported|exists|registered|present))'
-    $looksImported = $allText -match '(import(ed)?\s+success|successfully\s+import|uploaded\s+success)'
+    # Best-effort "new import succeeded" signals (different versions emit different strings)
+    $importSucceeded =
+        ($allText -match '(?i)\bimport(ed)?\b.*\bsuccess') -or
+        ($allText -match '(?i)\bsuccessfully\b.*\bimport') -or
+        ($allText -match '(?i)\bdevice(s)?\b.*\bimported\b') -or
+        ($allText -match '(?i)\bupload(ed)?\b.*\b(hash|hardware)\b')
 
-    if ($p.ExitCode -eq 0) {
-        if ($looksImported) {
-            Write-Output "Result: Imported successfully."
-        }
-        elseif ($looksAlready) {
-            Write-Output "Result: Already imported / no change."
-        }
-        else {
-            Write-Output "Result: Completed (verify in Intune if required)."
-        }
+    if ($alreadyImported) {
+        Write-Output "Device already imported."
         exit 0
     }
 
-    # Non-zero exit: show remaining stderr (still filtered)
-    if (@($stderr).Count -gt 0) {
-        $stderr | ForEach-Object { Write-Error $_ }
+    if ($p.ExitCode -eq 0 -and $importSucceeded) {
+        Write-Output "1 device imported successfully."
+        exit 0
+    }
+
+    if ($p.ExitCode -eq 0) {
+        # Completed but couldn't classify from text (rare)
+        Write-Output "Completed (verify in Autopilot/Intune if required)."
+        exit 0
+    }
+
+    # Non-zero exit: surface remaining filtered stderr as errors, otherwise generic fail
+    $errFiltered = @($stderr)
+    foreach ($pat in $noisePatterns)  { $errFiltered = @($errFiltered | Where-Object { $_ -notmatch $pat }) }
+    foreach ($pat in $benignPatterns) { $errFiltered = @($errFiltered | Where-Object { $_ -notmatch $pat }) }
+
+    if (@($errFiltered).Count -gt 0) {
+        $errFiltered | ForEach-Object { Write-Error $_ }
     }
     else {
         Write-Error "Get-WindowsAutopilotInfo failed with exit code $($p.ExitCode)."
