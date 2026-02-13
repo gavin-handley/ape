@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 try {
-    # Suppress Microsoft Graph SDK welcome/banner noise (applies to this process)
+    # Suppress Microsoft Graph SDK welcome/banner noise (if respected by Graph modules)
     $env:MG_SHOW_WELCOME_MESSAGE = 'false'
 
     # Networking in OOBE
@@ -36,10 +36,9 @@ try {
             # Expected in OOBE; continue with in-box modules
         }
         else {
-            # Keep this quiet unless you want to see it
+            # Keep quiet unless you want to see it
             # Write-Warning "PowerShellGet update/import issue (continuing): $($_.Exception.Message)"
         }
-
         Import-Module PowerShellGet -ErrorAction SilentlyContinue | Out-Null
     }
 
@@ -58,7 +57,7 @@ try {
     )
     foreach ($p in $common) { [void]$pathsToRemove.Add($p) }
 
-    $pathsToRemove = $pathsToRemove | Select-Object -Unique
+    $pathsToRemove = @($pathsToRemove | Select-Object -Unique)
 
     foreach ($p in $pathsToRemove) {
         if (Test-Path -LiteralPath $p) {
@@ -130,11 +129,14 @@ try {
 
     Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
 
+    # Always treat these as string arrays (handles $null + single line output)
+    $stdout = @($stdout)
+    $stderr = @($stderr)
+
     # ------------------------------------------------------------
     # OUTPUT FILTERING: whitelist only what you want engineers to see
     # ------------------------------------------------------------
 
-    # Drop known noisy lines (Graph welcome, notes, WAM messages, etc.)
     $noisePatterns = @(
         '^Welcome to Microsoft Graph!',
         '^Connected via delegated access',
@@ -149,20 +151,25 @@ try {
         'clientId'
     )
 
-    # Drop the known benign "Group Tag" message anywhere it appears
     $benignPatterns = @(
         'property\s+"Group Tag"\s+cannot be found'
     )
 
-    function Remove-Noise([string[]]$lines) {
+    function Remove-Noise {
+        param([string[]]$lines)
+
+        $lines = @($lines)  # force array
+        if ($lines.Count -eq 0) { return @() }
+
         $filtered = $lines
-        foreach ($pat in $noisePatterns)   { $filtered = $filtered | Where-Object { $_ -notmatch $pat } }
-        foreach ($pat in $benignPatterns)  { $filtered = $filtered | Where-Object { $_ -notmatch $pat } }
-        return ,$filtered
+        foreach ($pat in $noisePatterns)  { $filtered = @($filtered | Where-Object { $_ -notmatch $pat }) }
+        foreach ($pat in $benignPatterns) { $filtered = @($filtered | Where-Object { $_ -notmatch $pat }) }
+
+        return @($filtered)
     }
 
-    $stdout = Remove-Noise $stdout
-    $stderr = Remove-Noise $stderr
+    $stdout = Remove-Noise -lines $stdout
+    $stderr = Remove-Noise -lines $stderr
 
     # Whitelist only the two key progress lines
     $keepPatterns = @(
@@ -172,17 +179,21 @@ try {
 
     $kept = @()
     foreach ($pat in $keepPatterns) {
-        $kept += $stdout | Where-Object { $_ -match $pat }
-        $kept += $stderr | Where-Object { $_ -match $pat }
+        $kept += @($stdout | Where-Object { $_ -match $pat })
+        $kept += @($stderr | Where-Object { $_ -match $pat })
     }
 
-    # De-duplicate while preserving order
+    # De-duplicate while preserving order, and keep as array
     $seen = @{}
-    $keptUnique = foreach ($line in $kept) {
-        if (-not $seen.ContainsKey($line)) { $seen[$line] = $true; $line }
+    $keptUnique = @()
+    foreach ($line in @($kept)) {
+        if (-not $seen.ContainsKey($line)) {
+            $seen[$line] = $true
+            $keptUnique += $line
+        }
     }
 
-    if ($keptUnique.Count -gt 0) {
+    if (@($keptUnique).Count -gt 0) {
         $keptUnique | ForEach-Object { Write-Output $_ }
     }
 
@@ -190,10 +201,9 @@ try {
     # FINAL STATUS LINE (controlled by us)
     # ------------------------------------------------------------
 
-    # Best-effort classification from remaining output
-    $allText = (($stdout + $stderr) -join "`n")
+    $allText = (@($stdout + $stderr) -join "`n")
 
-    $looksAlready = $allText -match '(already\s+(imported|exists|registered|present))'
+    $looksAlready  = $allText -match '(already\s+(imported|exists|registered|present))'
     $looksImported = $allText -match '(import(ed)?\s+success|successfully\s+import|uploaded\s+success)'
 
     if ($p.ExitCode -eq 0) {
@@ -209,8 +219,8 @@ try {
         exit 0
     }
 
-    # Non-zero exit: show remaining stderr (but still filtered) as the error
-    if ($stderr.Count -gt 0) {
+    # Non-zero exit: show remaining stderr (still filtered)
+    if (@($stderr).Count -gt 0) {
         $stderr | ForEach-Object { Write-Error $_ }
     }
     else {
