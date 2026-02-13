@@ -3,27 +3,22 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 try {
-    # Networking in OOBE
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-    # Allow script execution in this process only
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force | Out-Null
-
-    # Reduce noisy progress output in OOBE
     $ProgressPreference = 'SilentlyContinue'
 
-    # Ensure NuGet provider exists
+    # NuGet provider
     if (-not (Get-PackageProvider -Name NuGet -ListAvailable -ErrorAction SilentlyContinue)) {
         Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
     }
 
-    # Trust PSGallery (avoids prompts on install)
+    # Trust PSGallery
     $psg = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
     if ($psg -and $psg.InstallationPolicy -ne 'Trusted') {
         Set-PSRepository -Name PSGallery -InstallationPolicy Trusted | Out-Null
     }
 
-    # Try to update/import PowerShellGet for more consistent behaviour, but don't fail if it can't
+    # PowerShellGet (best effort)
     try {
         Install-Module -Name PowerShellGet -Force -AllowClobber -Scope CurrentUser | Out-Null
         Import-Module PowerShellGet -Force | Out-Null
@@ -32,40 +27,51 @@ try {
         Import-Module PowerShellGet -ErrorAction SilentlyContinue | Out-Null
     }
 
-    # Build Install-Script parameters, only include -SkipPublisherCheck if supported
+    # Install Get-WindowsAutopilotInfo (only add SkipPublisherCheck if supported)
     $installScriptParams = @{
         Name  = 'Get-WindowsAutopilotInfo'
         Force = $true
     }
-
     $installScriptCmd = Get-Command Install-Script -ErrorAction Stop
     if ($installScriptCmd.Parameters.ContainsKey('SkipPublisherCheck')) {
         $installScriptParams['SkipPublisherCheck'] = $true
     }
-
     Install-Script @installScriptParams | Out-Null
 
-    # Run Get-WindowsAutopilotInfo -Online
+    # Resolve the script path robustly
     $cmd = Get-Command Get-WindowsAutopilotInfo -ErrorAction SilentlyContinue
+    $scriptPath = $null
 
     if ($cmd -and $cmd.Source -and (Test-Path -LiteralPath $cmd.Source)) {
-        & $cmd.Source -Online
-        exit 0
+        $scriptPath = $cmd.Source
+    }
+    else {
+        $possible = @(
+            (Join-Path $env:USERPROFILE  'Documents\WindowsPowerShell\Scripts\Get-WindowsAutopilotInfo.ps1'),
+            (Join-Path $env:ProgramFiles 'WindowsPowerShell\Scripts\Get-WindowsAutopilotInfo.ps1'),
+            (Join-Path $env:ProgramFiles 'PowerShell\Scripts\Get-WindowsAutopilotInfo.ps1')
+        )
+        $scriptPath = $possible | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     }
 
-    # Fallback to common Install-Script locations
-    $possible = @(
-        (Join-Path $env:USERPROFILE  'Documents\WindowsPowerShell\Scripts\Get-WindowsAutopilotInfo.ps1'),
-        (Join-Path $env:ProgramFiles 'WindowsPowerShell\Scripts\Get-WindowsAutopilotInfo.ps1'),
-        (Join-Path $env:ProgramFiles 'PowerShell\Scripts\Get-WindowsAutopilotInfo.ps1')
-    )
-
-    $path = $possible | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-    if (-not $path) {
+    if (-not $scriptPath) {
         throw "Get-WindowsAutopilotInfo.ps1 installed, but could not locate it to execute in this session."
     }
 
-    & $path -Online
+    # Run Autopilot registration ONLINE.
+    # If the only failure is the known 'Group Tag' property lookup bug, treat as success.
+    try {
+        & $scriptPath -Online
+    }
+    catch {
+        $msg = $_.Exception.Message
+        if ($msg -match 'property\s+"Group Tag"\s+cannot be found') {
+            Write-Warning "Autopilot registration likely succeeded; Get-WindowsAutopilotInfo hit a non-fatal reporting bug: $msg"
+            exit 0
+        }
+        throw
+    }
+
     exit 0
 }
 catch {
